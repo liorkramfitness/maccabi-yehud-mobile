@@ -8,27 +8,258 @@
 <div id="sessions" class="page"><div class="card"><h2>דיווח אימון</h2><label>קבוצה</label><select id="sessionTeam"></select><div class="two"><div><label>תאריך</label><input id="sessionDate" type="date"></div><div><label>שעה</label><input id="sessionTime" type="time"></div></div><label>מגרש</label><select id="sessionField"><option>מגרש מדרגות</option><option>מגרש קטן</option><option>מגרש ההוקי</option><option>מגרש גדול / רבע גדול</option><option>רחבת ה-16</option><option>אחר</option></select><label>סטטוס</label><select id="sessionStatus"><option value="planned">מתוכנן</option><option value="performed">בוצע</option><option value="cancelled">בוטל</option><option value="replaced">הוחלף</option></select><div class="two"><div><label>זמן כושר נטו (דקות)</label><input id="sessionMinutes" type="number" min="0" max="300"></div><div><label>דירוג מאמץ מאמן (0–10)</label><input id="sessionRPE" type="number" min="0" max="10" step="0.5"></div></div><label>תכנון</label><textarea id="plannedContent"></textarea><label>מה בוצע בפועל</label><textarea id="actualContent"></textarea><label>הערות ושינויים</label><textarea id="sessionNotes"></textarea><button class="btn" id="saveSession">שמור אימון בענן</button><div id="sessionMsg"></div></div><div class="card"><h2>אימונים אחרונים</h2><div id="sessionList"></div></div></div>
 <div id="attendance" class="page"><div class="card"><h2>נוכחות ועומס אישי</h2><label>אימון</label><select id="attendanceSession"></select><div class="muted">דירוג מאמץ אישי (RPE) הוא דיווח של השחקן, לא הערכת מאמן.</div><div id="attendanceList"></div><button class="btn" id="saveAttendance">שמור נוכחות בענן</button><div id="attendanceMsg"></div></div></div>
 <div id="loads" class="page"><div class="card"><h2>מעקב עומסים אישי</h2><p class="muted">עומס יחסי לדיווח אישי: דקות פעילות × RPE אישי. הנתון אינו מנבא פציעות ואינו כולל אוטומטית אימוני כדורגל, משחקים או עומס חיצוני.</p><label>קבוצה</label><select id="loadTeam"></select><div id="loadsList"></div></div></div>
-<div id="config" class="page"><div class="card"><h2>חיבור ל-Supabase</h2><p class="muted">הגדרות יישמרו במכשיר זה. ניתן להזין רק Project URL ומפתח Publishable. אין להדביק Secret key, service_role או סיסמת מסד נתונים.</p><label>Project URL</label><input dir="ltr" id="sbUrl" placeholder="https://xxxxx.supabase.co"><label>Publishable key</label><input dir="ltr" id="sbKey" placeholder="sb_publishable_..."><button class="btn" id="saveConfig">שמור חיבור</button><div id="configMsg"></div><p class="foot">הקוד של האתר עשוי להיות גלוי אם נפרסם אותו ב-GitHub Pages. שמות השחקנים לא כלולים בקוד ויישמרו רק ב-Supabase מאחורי התחברות והרשאות RLS.</p></div></div>
+<div id="config" class="page"><div class="card"><h2>חיבור ל-Supabase</h2><p class="muted">הגדרות יישמרו במכשיר זה. ניתן להזין רק Project URL ומפתח Publishable. אין להדביק Secret key, service_role או סיסמת מסד נתונים.</p><label>Project URL</label><input dir="ltr" id="sbUrl" placeholder="https://xxxxx.supabase.co"><label>Publishable key</label><input dir="ltr" id="sbKey" placeholder="sb_publishable_..."><button class="btn" id="saveConfig">שמור חיבור</button><div id="configMsg"></div><p class="foot">הקוד של האתר עשוי להיות גלוי אם נפרסם אותו ב-GitHub Pages. שמות השחקנים לא כלולים בקוד. הגנת הנתונים ב-Supabase מחייבת הגדרה ואימות של הרשאות RLS במסד הנתונים; התחברות לבדה אינה מספיקה.</p></div></div>
 </main><script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script><script>
-'use strict';const $=id=>document.getElementById(id),escapeHtml=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));let db=null,user=null,teams=[],players=[],members=[],sessions=[],attendance=[],recovery=false;const configKey='maccabi_yehud_demo_connection_v1';const msg=(id,v,err=false)=>{$(id).textContent=v;$(id).className=err?'error':'ok'};const readConfig=()=>{try{return JSON.parse(localStorage.getItem(configKey)||'{}')}catch{return {}}};
-function showAuth(){ $('notLogged').classList.toggle('hide',!!user||recovery);$('logged').classList.toggle('hide',!user||recovery);$('resetPane').classList.toggle('hide',!recovery);$('identity').textContent=user?.email||''; $('cloudStatus').textContent=user?'מחובר לענן כמשתמש מאומת':'יש להתחבר כדי לשמור נתונים';}
+'use strict';
+const $=id=>document.getElementById(id);
+const escapeHtml=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const configKey='maccabi_yehud_demo_connection_v1';
+let db=null,user=null,teams=[],players=[],members=[],sessions=[],attendance=[],recovery=false;
+let authSubscription=null,authVersion=0,loadVersion=0,loggingOut=false;
+const pendingActions=new Set();
+const pendingPromises=new Map();
+const confirmedSaves=new Map(),playerRequests=new Map();
+const msg=(id,value,error=false)=>{$(id).textContent=value;$(id).className=error?'error':'ok'};
+const readConfig=()=>{try{return JSON.parse(localStorage.getItem(configKey)||'{}')}catch{return {}}};
+
+function israelDate(now=new Date()){
+  const parts=new Intl.DateTimeFormat('en-US',{timeZone:'Asia/Jerusalem',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(now);
+  const part=type=>parts.find(p=>p.type===type).value;
+  return `${part('year')}-${part('month')}-${part('day')}`;
+}
+function loadRows(playerId,teamId,now=new Date()){
+  const today=israelDate(now),start=new Date(today+'T12:00:00Z');
+  start.setUTCDate(start.getUTCDate()-6);
+  const first=start.toISOString().slice(0,10);
+  return attendance.filter(a=>{
+    if(a.player_id!==playerId||!['present','late','partial'].includes(a.attendance_status))return false;
+    if(a.active_minutes==null||a.player_rpe==null||a.active_minutes===''||a.player_rpe==='')return false;
+    const minutes=Number(a.active_minutes),rpe=Number(a.player_rpe);
+    if(!Number.isInteger(minutes)||minutes<=0||minutes>300||!Number.isFinite(rpe)||rpe<0||rpe>10||!Number.isInteger(rpe*2))return false;
+    const session=sessions.find(s=>s.id===a.session_id);
+    return session&&session.team_id===teamId&&session.session_status==='performed'&&session.scheduled_date>=first&&session.scheduled_date<=today;
+  });
+}
+function numberValue(input,label,min,max,step=1,required=false){
+  const raw=input.value.trim();
+  if(input.validity?.badInput)throw Error(label+': יש להזין מספר תקין.');
+  if(!raw){if(required)throw Error(label+': שדה חובה.');return null;}
+  const value=Number(raw);
+  if(!Number.isFinite(value)||value<min||value>max||!Number.isInteger(value/step))throw Error(`${label}: יש להזין ערך בין ${min} ל-${max} בקפיצות של ${step}.`);
+  return value;
+}
+function showAuth(){
+  $('notLogged').classList.toggle('hide',!!user||recovery);
+  $('logged').classList.toggle('hide',!user||recovery);
+  $('resetPane').classList.toggle('hide',!recovery);
+  $('identity').textContent=user?.email||'';
+  $('cloudStatus').textContent=user?'מחובר לענן כמשתמש מאומת':'יש להתחבר כדי לשמור נתונים';
+}
+function clearUserData(){
+  authVersion++;loadVersion++;
+  confirmedSaves.clear();playerRequests.clear();
+  user=null;recovery=false;teams=[];players=[];members=[];sessions=[];attendance=[];
+  document.querySelectorAll('main input,main textarea').forEach(input=>{if(!['sbUrl','sbKey'].includes(input.id))input.value=''});
+  ['sessionField','sessionStatus'].forEach(id=>$(id).selectedIndex=0);
+  ['authMsg','teamMsg','playerMsg','sessionMsg','attendanceMsg'].forEach(id=>$(id).textContent='');
+  render();showAuth();
+}
+function context(){
+  if(!db||!user||loggingOut||recovery)throw Error('יש להתחבר לפני שמירה.');
+  return {client:db,ownerId:user.id,version:authVersion};
+}
+function isCurrent(ctx){return ctx.client===db&&ctx.version===authVersion&&ctx.ownerId===user?.id&&!loggingOut;}
+function assertCurrent(ctx){if(!isCurrent(ctx))throw Error('החיבור השתנה. יש להתחבר מחדש.');}
+function bindAction(id,messageId,action){
+  $(id).onclick=async()=>{
+    if(pendingActions.has(id)||loggingOut)return;
+    pendingActions.add(id);$(id).disabled=true;
+    const version=authVersion;
+    const task=Promise.resolve().then(()=>{if(!loggingOut&&version===authVersion)return action()});
+    pendingPromises.set(id,task);
+    try{await task}catch(error){if(version===authVersion)msg(messageId,error.message,true)}
+    finally{pendingActions.delete(id);pendingPromises.delete(id);$(id).disabled=false;}
+  };
+}
+async function loadAll(){
+  if(!db||!user||loggingOut||recovery)return;
+  const ctx=context(),request=++loadVersion,result=[];
+  for(const name of ['my_teams','my_players','my_team_players','my_sessions','my_attendance']){
+    const {data,error}=await ctx.client.from(name).select('*').eq('owner_id',ctx.ownerId);
+    if(!isCurrent(ctx)||request!==loadVersion)return;
+    if(error)throw Error(name+': '+error.message);
+    result.push(data||[]);
+  }
+  if(!isCurrent(ctx)||request!==loadVersion)return;
+  [teams,players,members,sessions,attendance]=result;render();
+}
+async function connect(){
+  authSubscription?.unsubscribe();authSubscription=null;
+  clearUserData();db=null;
+  const version=authVersion,c=readConfig();
+  $('sbUrl').value=c.url||'';$('sbKey').value=c.key||'';
+  if(!c.url||!c.key){msg('authMsg','תחילה יש להגדיר את פרטי החיבור במסך הגדרות.');return;}
+  if(!window.supabase?.createClient){msg('authMsg','ספריית Supabase לא נטענה. בדוק חיבור לאינטרנט.',true);return;}
+  try{
+    const client=window.supabase.createClient(c.url,c.key);db=client;
+    const {data:listener}=client.auth.onAuthStateChange((event,session)=>{
+      if(client!==db||loggingOut)return;
+      if(event==='SIGNED_OUT'){clearUserData();return;}
+      if(!['INITIAL_SESSION','PASSWORD_RECOVERY','SIGNED_IN','TOKEN_REFRESHED'].includes(event))return;
+      const next=session?.user||null;
+      if(user?.id!==next?.id){clearUserData();}
+      user=next;
+      if(event==='PASSWORD_RECOVERY')recovery=true;
+      showAuth();
+      if(recovery)msg('authMsg','בחר סיסמה חדשה.');
+      else if(user){const current=authVersion;setTimeout(()=>{if(current===authVersion&&client===db&&!loggingOut)loadAll().catch(e=>{if(current===authVersion)msg('authMsg',e.message,true)})},0);}
+    });
+    authSubscription=listener.subscription;
+    const {data,error}=await client.auth.getSession();
+    if(version!==authVersion||client!==db||loggingOut)return;
+    if(error)throw error;
+    user=data?.session?.user||null;showAuth();
+    if(user&&!recovery)await loadAll();else if(!recovery)msg('authMsg','החיבור הוגדר. אפשר להתחבר.');
+  }catch(error){if(version===authVersion)msg('authMsg','שגיאת חיבור: '+error.message,true);}
+}
 function setOptions(id,arr){const prev=$(id).value;$(id).innerHTML=arr.map(t=>`<option value="${escapeHtml(t.id)}">${escapeHtml(t.birth_year+' | '+t.coach_name+' | '+t.team_name)}</option>`).join('');if(arr.some(t=>t.id===prev))$(id).value=prev}
-async function connect(){const c=readConfig();$('sbUrl').value=c.url||'';$('sbKey').value=c.key||'';if(!c.url||!c.key){msg('authMsg','תחילה יש להגדיר את פרטי החיבור במסך הגדרות.');showAuth();return}if(!window.supabase?.createClient){msg('authMsg','ספריית Supabase לא נטענה. בדוק חיבור לאינטרנט.',true);return}try{db=window.supabase.createClient(c.url,c.key);db.auth.onAuthStateChange((event,session)=>{if(event==='PASSWORD_RECOVERY'){recovery=true;user=session?.user||null;showAuth();msg('authMsg','בחר סיסמה חדשה.')}else if(event==='SIGNED_OUT'){user=null;recovery=false;showAuth()}else if(event==='SIGNED_IN'||event==='TOKEN_REFRESHED'){user=session?.user||null;showAuth();if(user&&!recovery)setTimeout(()=>loadAll().catch(e=>msg('authMsg',e.message,true)),0)}});const {data}=await db.auth.getSession();user=data?.session?.user||null;showAuth();if(user&&!recovery)await loadAll();else msg('authMsg','החיבור הוגדר. אפשר להתחבר.')}catch(e){msg('authMsg','שגיאת חיבור: '+e.message,true)}}
-async function loadAll(){if(!db||!user)return;const names=['my_teams','my_players','my_team_players','my_sessions','my_attendance'];let result=[];for(const name of names){const {data,error}=await db.from(name).select('*').eq('owner_id',user.id);if(error)throw Error(name+': '+error.message);result.push(data||[])}[teams,players,members,sessions,attendance]=result;render()}
 function render(){ $('teamNum').textContent=teams.length;$('sessionNum').textContent=sessions.length;['playerTeam','rosterTeam','sessionTeam','loadTeam'].forEach(id=>setOptions(id,teams));$('teamList').innerHTML=teams.length?teams.map(t=>`<div class="listitem"><strong>${escapeHtml(t.birth_year)} | ${escapeHtml(t.team_name)}</strong> · ${escapeHtml(t.coach_name)} <span class="pill">${members.filter(m=>m.team_id===t.id).length} שחקנים</span></div>`).join(''):'עדיין לא נוספו קבוצות';renderRoster();renderSessions();renderAttendance();renderLoads()}
 function renderRoster(){const id=$('rosterTeam').value;$('rosterList').innerHTML=members.filter(m=>m.team_id===id).map(m=>players.find(p=>p.id===m.player_id)).filter(Boolean).map(p=>`<div class="listitem">${escapeHtml(p.full_name)} <span class="muted">${escapeHtml(p.age_note||'')}</span></div>`).join('')||'<p class="muted">אין שחקנים בקבוצה.</p>'}
 function renderSessions(){const sorted=[...sessions].sort((a,b)=>String(b.scheduled_date).localeCompare(String(a.scheduled_date)));$('sessionList').innerHTML=sorted.slice(0,25).map(s=>`<div class="listitem"><b>${escapeHtml(s.scheduled_date)}</b> · ${escapeHtml(teams.find(t=>t.id===s.team_id)?.coach_name||'קבוצה')} · ${escapeHtml(s.field_name||'מגרש לא דווח')} <span class="pill">${escapeHtml(s.session_status)}</span></div>`).join('')||'<p class="muted">אין אימונים שמורים.</p>';const v=$('attendanceSession').value;$('attendanceSession').innerHTML=sorted.map(s=>`<option value="${escapeHtml(s.id)}">${escapeHtml(s.scheduled_date+' | '+(teams.find(t=>t.id===s.team_id)?.coach_name||''))}</option>`).join('');if(sorted.some(s=>s.id===v))$('attendanceSession').value=v}
-function renderAttendance(){const s=sessions.find(s=>s.id===$('attendanceSession').value),container=$('attendanceList');if(!s){container.innerHTML='<p class="muted">אין אימונים להצגת נוכחות.</p>';return}container.innerHTML=members.filter(m=>m.team_id===s.team_id).map(m=>players.find(p=>p.id===m.player_id)).filter(Boolean).map(p=>{const a=attendance.find(x=>x.session_id===s.id&&x.player_id===p.id)||{};return `<div class="listitem" data-player="${escapeHtml(p.id)}"><strong>${escapeHtml(p.full_name)}</strong><div class="two"><div><label>נוכחות</label><select class="att-status">${[['unknown','לא דווח'],['present','הגיע'],['absent','נעדר'],['late','איחר'],['partial','חלקי'],['injured_not_participating','פצוע, לא השתתף']].map(([v,l])=>`<option value="${v}" ${a.attendance_status===v?'selected':''}>${l}</option>`).join('')}</select></div><div><label>דקות פעילות</label><input class="att-min" type="number" min="0" max="300" value="${a.active_minutes??''}"></div></div><label>RPE אישי (0–10)</label><input class="att-rpe" type="number" step="0.5" min="0" max="10" value="${a.player_rpe??''}"></div>`}).join('')||'<p class="muted">אין שחקנים משויכים לאימון.</p>'}
-function renderLoads(){const id=$('loadTeam').value,now=new Date(),start=new Date(now);start.setDate(now.getDate()-6);const minDate=start.toISOString().slice(0,10);$('loadsList').innerHTML=members.filter(m=>m.team_id===id).map(m=>players.find(p=>p.id===m.player_id)).filter(Boolean).map(p=>{const rows=attendance.filter(a=>a.player_id===p.id&&a.player_rpe!=null&&a.active_minutes!=null).filter(a=>{const s=sessions.find(x=>x.id===a.session_id);return s&&s.scheduled_date>=minDate&&s.scheduled_date<=now.toISOString().slice(0,10)});const total=rows.reduce((sum,a)=>sum+a.active_minutes*a.player_rpe,0);return `<div class="listitem"><b>${escapeHtml(p.full_name)}</b><div class="muted">${rows.length?`עומס מדווח ב-7 ימים: ${total.toFixed(0)} יחידות יחסיות · ${rows.length} דיווחים`:'אין דיווחי RPE אישיים בשבעת הימים האחרונים'}</div></div>`}).join('')||'<p class="muted">אין שחקנים בקבוצה.</p>'}
-async function insertOne(table,data){if(!user)throw Error('יש להתחבר לפני שמירה.');const {error}=await db.from(table).insert({...data,owner_id:user.id});if(error)throw error;await loadAll()}
-$('saveConfig').onclick=async()=>{const url=$('sbUrl').value.trim().replace(/\/$/,'');const key=$('sbKey').value.trim();if(!/^https:\/\/[a-z0-9-]+\.supabase\.co$/i.test(url)||!key.startsWith('sb_publishable_'))return msg('configMsg','יש להזין כתובת Supabase תקינה ומפתח Publishable בלבד.',true);localStorage.setItem(configKey,JSON.stringify({url,key}));msg('configMsg','נשמר.');await connect()};
-$('login').onclick=async()=>{if(!db)return msg('authMsg','תחילה יש להגדיר חיבור.',true);$('login').disabled=true;try{const {error}=await db.auth.signInWithPassword({email:$('email').value.trim(),password:$('password').value});if(error)throw error;$('password').value='';msg('authMsg','התחברת בהצלחה.')}catch(e){msg('authMsg','שגיאה בהתחברות: '+e.message,true)}finally{$('login').disabled=false}};
-$('recover').onclick=async()=>{if(!db)return msg('authMsg','יש להגדיר חיבור.',true);if(location.protocol!=='https:')return msg('authMsg','נדרש אתר HTTPS חי לצורך שחזור סיסמה.',true);if(!$('email').value.trim())return msg('authMsg','הכנס כתובת דוא"ל.',true);$('recover').disabled=true;try{const {error}=await db.auth.resetPasswordForEmail($('email').value.trim(),{redirectTo:location.origin+location.pathname});if(error)throw error;msg('authMsg','אם המייל קיים, נשלח קישור שחזור.')}catch(e){msg('authMsg',e.message,true)}finally{$('recover').disabled=false}};
-$('savepass').onclick=async()=>{if(!db||!recovery)return msg('authMsg','דרוש קישור שחזור פעיל.',true);if($('newpass').value.length<12||$('newpass').value!==$('newpass2').value)return msg('authMsg','הסיסמאות אינן זהות או קצרות מדי.',true);try{const {error}=await db.auth.updateUser({password:$('newpass').value});if(error)throw error;recovery=false;showAuth();msg('authMsg','הסיסמה עודכנה.')}catch(e){msg('authMsg',e.message,true)}};
-$('logout').onclick=async()=>{if(db)await db.auth.signOut()};
-$('addTeam').onclick=async()=>{try{if(!$('teamName').value.trim()||!$('coachName').value.trim())throw Error('יש למלא שם קבוצה ומאמן.');await insertOne('my_teams',{birth_year:Number($('teamYear').value),team_name:$('teamName').value.trim(),coach_name:$('coachName').value.trim(),status:'active'});msg('teamMsg','הקבוצה נשמרה.')}catch(e){msg('teamMsg',e.message,true)}};
-$('addPlayer').onclick=async()=>{try{if(!user||!$('playerTeam').value||!$('playerName').value.trim())throw Error('בחר קבוצה והזן שם שחקן.');const {data,error}=await db.from('my_players').insert({owner_id:user.id,full_name:$('playerName').value.trim(),age_note:$('ageNote').value.trim()||null}).select('id').single();if(error)throw error;const {error:e2}=await db.from('my_team_players').insert({owner_id:user.id,team_id:$('playerTeam').value,player_id:data.id});if(e2)throw e2;$('playerName').value='';await loadAll();msg('playerMsg','השחקן נשמר.')}catch(e){msg('playerMsg',e.message,true)}};
-$('saveSession').onclick=async()=>{try{if(!$('sessionTeam').value||!$('sessionDate').value)throw Error('בחר קבוצה ותאריך.');await insertOne('my_sessions',{team_id:$('sessionTeam').value,scheduled_date:$('sessionDate').value,start_time:$('sessionTime').value||null,field_name:$('sessionField').value,session_status:$('sessionStatus').value,active_minutes:$('sessionMinutes').value===''?null:Number($('sessionMinutes').value),coach_intensity:$('sessionRPE').value===''?null:Number($('sessionRPE').value),planned_content:$('plannedContent').value||null,actual_content:$('actualContent').value||null,notes:$('sessionNotes').value||null});msg('sessionMsg','האימון נשמר בענן.')}catch(e){msg('sessionMsg',e.message,true)}};
-$('saveAttendance').onclick=async()=>{try{if(!user||!$('attendanceSession').value)throw Error('בחר אימון.');const session_id=$('attendanceSession').value;let rows=[...document.querySelectorAll('#attendanceList [data-player]')].map(x=>({owner_id:user.id,session_id,player_id:x.dataset.player,attendance_status:x.querySelector('.att-status').value,active_minutes:x.querySelector('.att-min').value===''?null:Number(x.querySelector('.att-min').value),player_rpe:x.querySelector('.att-rpe').value===''?null:Number(x.querySelector('.att-rpe').value)}));if(!rows.length)throw Error('אין שחקנים באימון.');const {error}=await db.from('my_attendance').upsert(rows,{onConflict:'session_id,player_id'});if(error)throw error;await loadAll();msg('attendanceMsg','הנוכחות נשמרה בענן.')}catch(e){msg('attendanceMsg',e.message,true)}};
-['rosterTeam','attendanceSession','loadTeam'].forEach(id=>$(id).addEventListener('change',()=>{renderRoster();renderAttendance();renderLoads()}));document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.page').forEach(x=>x.classList.toggle('active',x.id===b.dataset.tab))});$('sessionDate').value=new Date().toLocaleDateString('en-CA');connect();
+function renderAttendance(){const s=sessions.find(s=>s.id===$('attendanceSession').value),container=$('attendanceList');if(!s){container.innerHTML='<p class="muted">אין אימונים להצגת נוכחות.</p>';return}container.innerHTML=members.filter(m=>m.team_id===s.team_id).map(m=>players.find(p=>p.id===m.player_id)).filter(Boolean).map(p=>{const a=attendance.find(x=>x.session_id===s.id&&x.player_id===p.id)||{};return `<div class="listitem" data-player="${escapeHtml(p.id)}"><strong>${escapeHtml(p.full_name)}</strong><div class="two"><div><label>נוכחות</label><select class="att-status">${[['unknown','לא דווח'],['present','הגיע'],['absent','נעדר'],['late','איחר'],['partial','חלקי'],['injured_not_participating','פצוע, לא השתתף']].map(([v,l])=>`<option value="${v}" ${a.attendance_status===v?'selected':''}>${l}</option>`).join('')}</select></div><div><label>דקות פעילות</label><input class="att-min" type="number" min="0" max="300" value="${escapeHtml(a.active_minutes??'')}"></div></div><label>RPE אישי (0–10)</label><input class="att-rpe" type="number" step="0.5" min="0" max="10" value="${escapeHtml(a.player_rpe??'')}"></div>`}).join('')||'<p class="muted">אין שחקנים משויכים לאימון.</p>'}
+function renderLoads(){
+  const teamId=$('loadTeam').value;
+  $('loadsList').innerHTML=members.filter(m=>m.team_id===teamId).map(m=>players.find(p=>p.id===m.player_id)).filter(Boolean).map(p=>{
+    const rows=loadRows(p.id,teamId);
+    const total=rows.reduce((sum,a)=>sum+Number(a.active_minutes)*Number(a.player_rpe),0);
+    return `<div class="listitem"><b>${escapeHtml(p.full_name)}</b><div class="muted">${rows.length?`עומס מדווח ב-7 ימים: ${total.toFixed(0)} יחידות יחסיות · ${rows.length} דיווחים`:'אין דיווחי RPE אישיים בשבעת הימים האחרונים'}</div></div>`;
+  }).join('')||'<p class="muted">אין שחקנים בקבוצה.</p>';
+}
+
+// A committed write and the following read are separate outcomes.
+async function refreshSaved(ctx,messageId,success){
+  if(!isCurrent(ctx))return;
+  msg(messageId,success);
+  try{await loadAll();if(isCurrent(ctx))msg(messageId,success);}
+  catch(error){
+    if(!isCurrent(ctx))return;
+    msg(messageId,success+' רענון הנתונים נכשל. אפשר לרענן שוב ללא שמירה נוספת.');
+    const button=document.createElement('button');
+    button.type='button';button.className='btn alt';button.textContent='רענן נתונים';
+    button.onclick=async()=>{
+      if(button.disabled||!isCurrent(ctx))return;
+      button.disabled=true;
+      try{await refreshSaved(ctx,messageId,success)}finally{button.disabled=false;}
+    };
+    $(messageId).appendChild(button);
+  }
+}
+async function saveAndRefresh(actionId,messageId,data,ctx,write,success){
+  const fingerprint=JSON.stringify(data);
+  assertCurrent(ctx);
+  // A repeated click after a successful write retries only the read.
+  const saved=confirmedSaves.get(actionId);
+  if(!saved?.has(fingerprint)){
+    const {error}=await write();
+    assertCurrent(ctx);if(error)throw error;
+    // Attendance is editable: allow a later change back to a previous value.
+    confirmedSaves.set(actionId,new Set(actionId==='saveAttendance'?[fingerprint]:[...(saved||[]),fingerprint]));
+  }
+  await refreshSaved(ctx,messageId,success);
+}
+async function insertOne(table,data,ctx,actionId,messageId,success){
+  await saveAndRefresh(actionId,messageId,data,ctx,()=>ctx.client.from(table).insert({...data,owner_id:ctx.ownerId}),success);
+}
+bindAction('saveConfig','configMsg',async()=>{
+  const url=$('sbUrl').value.trim().replace(/\/$/,''),key=$('sbKey').value.trim();
+  if(!/^https:\/\/[a-z0-9-]+\.supabase\.co$/i.test(url)||!key.startsWith('sb_publishable_'))throw Error('יש להזין כתובת Supabase תקינה ומפתח Publishable בלבד.');
+  if(pendingActions.size>1)throw Error('יש להמתין לסיום הפעולה הנוכחית.');
+  localStorage.setItem(configKey,JSON.stringify({url,key}));msg('configMsg','נשמר.');await connect();
+});
+bindAction('login','authMsg',async()=>{
+  if(!db)throw Error('תחילה יש להגדיר חיבור.');
+  const client=db,version=authVersion;
+  const {error}=await client.auth.signInWithPassword({email:$('email').value.trim(),password:$('password').value});
+  if(client!==db||loggingOut)return;
+  if(error){if(version===authVersion)throw error;return;}
+  $('password').value='';
+});
+bindAction('recover','authMsg',async()=>{
+  if(!db)throw Error('יש להגדיר חיבור.');
+  if(location.protocol!=='https:')throw Error('נדרש אתר HTTPS חי לצורך שחזור סיסמה.');
+  const email=$('email').value.trim(),version=authVersion;
+  if(!email)throw Error('הכנס כתובת דוא״ל.');
+  const {error}=await db.auth.resetPasswordForEmail(email,{redirectTo:location.origin+location.pathname});
+  if(version!==authVersion)return;if(error)throw error;
+  msg('authMsg','אם המייל קיים, נשלח קישור שחזור.');
+});
+bindAction('savepass','authMsg',async()=>{
+  if(!db||!recovery)throw Error('דרוש קישור שחזור פעיל.');
+  if($('newpass').value.length<12||$('newpass').value!==$('newpass2').value)throw Error('הסיסמאות אינן זהות או קצרות מדי.');
+  const version=authVersion;
+  const {error}=await db.auth.updateUser({password:$('newpass').value});
+  if(version!==authVersion)return;if(error)throw error;
+  $('newpass').value='';$('newpass2').value='';recovery=false;showAuth();
+  await loadAll();if(version===authVersion)msg('authMsg','הסיסמה עודכנה.');
+});
+$('logout').onclick=async()=>{
+  if(loggingOut)return;
+  loggingOut=true;$('logout').disabled=true;
+  const client=db;
+  clearUserData();
+  // Remove this device's session only. No application records are deleted.
+  try{
+    // An in-flight login must finish before its session is removed.
+    // Data writes must not delay removal of the local auth session.
+    await Promise.allSettled([...pendingPromises.entries()].filter(([id])=>['login','savepass','saveConfig'].includes(id)).map(([,task])=>task));
+    if(client){const {error}=await client.auth.signOut({scope:'local'});if(error)throw error;}
+    clearUserData();
+    msg('authMsg','התנתקת.');
+  }catch(error){msg('authMsg','הנתונים הוסרו מהמסך, אך ההתנתקות לא הושלמה. יש לנסות שוב: '+error.message,true);$('logged').classList.remove('hide');}
+  finally{loggingOut=false;$('logout').disabled=false;}
+};
+bindAction('addTeam','teamMsg',async()=>{
+  const ctx=context();
+  if(!$('teamName').value.trim()||!$('coachName').value.trim())throw Error('יש למלא שם קבוצה ומאמן.');
+  const birth_year=numberValue($('teamYear'),'שנתון',2000,2100,1,true);
+  await insertOne('my_teams',{birth_year,team_name:$('teamName').value.trim(),coach_name:$('coachName').value.trim(),status:'active'},ctx,'addTeam','teamMsg','הקבוצה נשמרה.');
+});
+bindAction('addPlayer','playerMsg',async()=>{
+  const ctx=context(),team_id=$('playerTeam').value;
+  const full_name=$('playerName').value.trim(),age_note=$('ageNote').value.trim()||null;
+  if(!team_id||!full_name)throw Error('בחר קבוצה והזן שם שחקן.');
+  const data={team_id,full_name,age_note},fingerprint=JSON.stringify(data);
+  // Retain the same request ID on error, including an ambiguous network failure.
+  if(!playerRequests.has(fingerprint))playerRequests.set(fingerprint,crypto.randomUUID());
+  await saveAndRefresh('addPlayer','playerMsg',data,ctx,async()=>{
+    const result=await ctx.client.rpc('create_player_with_team',{
+      p_player_id:playerRequests.get(fingerprint),p_team_id:team_id,p_full_name:full_name,p_age_note:age_note
+    });
+    if(result.error?.code==='PGRST202')throw Error('שמירת שחקנים דורשת עדכון מאושר במסד הנתונים. לא נוצר שחקן.');
+    return result;
+  },'השחקן והשיוך לקבוצה נשמרו.');
+});
+bindAction('saveSession','sessionMsg',async()=>{
+  const ctx=context();
+  if(!$('sessionTeam').value||!$('sessionDate').value)throw Error('בחר קבוצה ותאריך.');
+  const active_minutes=numberValue($('sessionMinutes'),'דקות אימון',0,300);
+  const coach_intensity=numberValue($('sessionRPE'),'RPE מאמן',0,10,0.5);
+  await insertOne('my_sessions',{team_id:$('sessionTeam').value,scheduled_date:$('sessionDate').value,start_time:$('sessionTime').value||null,field_name:$('sessionField').value,session_status:$('sessionStatus').value,active_minutes,coach_intensity,planned_content:$('plannedContent').value||null,actual_content:$('actualContent').value||null,notes:$('sessionNotes').value||null},ctx,'saveSession','sessionMsg','האימון נשמר בענן.');
+});
+bindAction('saveAttendance','attendanceMsg',async()=>{
+  const ctx=context(),session_id=$('attendanceSession').value;
+  if(!session_id)throw Error('בחר אימון.');
+  const rows=[...document.querySelectorAll('#attendanceList [data-player]')].map(x=>({
+    owner_id:ctx.ownerId,session_id,player_id:x.dataset.player,attendance_status:x.querySelector('.att-status').value,
+    active_minutes:numberValue(x.querySelector('.att-min'),'דקות פעילות',0,300),
+    player_rpe:numberValue(x.querySelector('.att-rpe'),'RPE אישי',0,10,0.5)
+  }));
+  if(!rows.length)throw Error('אין שחקנים באימון.');
+  await saveAndRefresh('saveAttendance','attendanceMsg',rows,ctx,
+    ()=>ctx.client.from('my_attendance').upsert(rows,{onConflict:'session_id,player_id'}),'הנוכחות נשמרה בענן.');
+});
+['rosterTeam','attendanceSession','loadTeam'].forEach(id=>$(id).addEventListener('change',()=>{renderRoster();renderAttendance();renderLoads()}));
+document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.page').forEach(x=>x.classList.toggle('active',x.id===b.dataset.tab))});
+connect();
+$('sessionDate').value=israelDate();
 </script></body></html>

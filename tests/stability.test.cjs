@@ -16,11 +16,16 @@ async function app(t){
   await page.evaluate(()=>{
     window.mock={writes:[],reads:[],tables:{},delays:{},releases:{},signOuts:[],signOutError:null};
     mock.client={
+      async rpc(name,args){
+        mock.writes.push({table:'my_players',rpc:name,data:args});
+        if(mock.delays.write)await new Promise(resolve=>mock.releases.write=resolve);
+        return {data:args.p_player_id,error:mock.rpcError||mock.writeError||null};
+      },
       from(table){return {
         select(){return {eq:async(column,id)=>{
           mock.reads.push({table,column,id});
           if(mock.delays[table])await new Promise(resolve=>mock.releases[table]=resolve);
-          return {data:mock.tables[table]||[],error:null};
+          return {data:mock.tables[table]||[],error:mock.readError||null};
         }}},
         insert(data){
           mock.writes.push({table,data});
@@ -104,7 +109,7 @@ for(const id of ['addTeam','addPlayer','saveSession','saveAttendance']){
     await page.evaluate(id=>{window.firstSave=$(id).onclick();window.secondSave=$(id).onclick()},id);
     await page.waitForFunction(()=>!!mock.releases.write);
     assert.equal(await page.evaluate(id=>$(id).disabled,id),true);
-    // Player creation includes a second, distinct membership write.
+    // Player creation uses a single atomic RPC instead of two inserts.
     assert.equal(await page.evaluate(id=>mock.writes.filter(w=>w.table===(id==='addPlayer'?'my_players':id==='addTeam'?'my_teams':id==='saveSession'?'my_sessions':'my_attendance')).length,id),1);
     await page.evaluate(async()=>{mock.releases.write();await window.firstSave;await window.secondSave});
     assert.equal(await page.evaluate(id=>$(id).disabled,id),false);
@@ -208,4 +213,78 @@ test('logout cancels a save queued in the same event turn',async t=>{
   const page=await app(t);
   await page.evaluate(async()=>{const saving=$('saveConfig').onclick();const leaving=$('logout').onclick();await Promise.all([saving,leaving])});
   assert.equal(await page.evaluate(()=>user===null&&mock.signOuts.length===1),true);
+});
+
+
+for(const [actionId,messageId] of [['addTeam','teamMsg'],['addPlayer','playerMsg'],['saveSession','sessionMsg'],['saveAttendance','attendanceMsg']]){
+  test(`${actionId}: committed save remains successful after refresh failure; retry refresh/save cannot duplicate`,async t=>{
+    const page=await app(t);
+    await page.evaluate(async actionId=>{
+      $('teamYear').value='2012';$('teamName').value='קבוצה';$('coachName').value='מאמן';$('playerName').value='שחקן';$('sessionDate').value='2026-11-17';
+      mock.readError={message:'read failed'};await $(actionId).onclick();
+    },actionId);
+    assert.equal(await page.evaluate(id=>$(id).className==='ok'&&$(id).textContent.includes('נשמר')&&$(id).textContent.includes('רענון הנתונים נכשל'),messageId),true);
+    assert.equal(await page.evaluate(()=>mock.writes.length),1);
+    // Retry while the read is still failing, then click save again unchanged.
+    await page.evaluate(id=>document.querySelector(`#${id} button`).onclick(),messageId);
+    await page.evaluate(id=>$(id).onclick(),actionId);
+    assert.equal(await page.evaluate(()=>mock.writes.length),1);
+    await page.evaluate(()=>mock.readError=null);
+    await page.evaluate(id=>document.querySelector(`#${id} button`).onclick(),messageId);
+    assert.equal(await page.evaluate(id=>!$(id).textContent.includes('נכשל'),messageId),true);
+    assert.equal(await page.evaluate(()=>mock.writes.length),1);
+  });
+}
+
+test('player creation uses one RPC and reuses its request ID after a lost response',async t=>{
+  const page=await app(t);
+  await page.evaluate(async()=>{
+    $('playerName').value='שחקן חדש';mock.rpcError={message:'connection lost'};
+    await $('addPlayer').onclick();mock.rpcError=null;await $('addPlayer').onclick();
+  });
+  const writes=await page.evaluate(()=>mock.writes);
+  assert.equal(writes.length,2);
+  assert.ok(writes.every(w=>w.rpc==='create_player_with_team'));
+  assert.equal(writes[0].data.p_player_id,writes[1].data.p_player_id);
+  assert.equal(writes[0].data.p_team_id,'team');
+  assert.equal(Object.hasOwn(writes[0].data,'owner_id'),false);
+  await page.evaluate(()=>$('addPlayer').onclick());
+  assert.equal(await page.evaluate(()=>mock.writes.length),2);
+});
+
+test('missing RPC fails safely without falling back to non-atomic inserts',async t=>{
+  const page=await app(t);
+  await page.evaluate(async()=>{$('playerName').value='שחקן';mock.rpcError={code:'PGRST202',message:'missing function'};await $('addPlayer').onclick()});
+  assert.equal(await page.evaluate(()=>mock.writes.length===1&&mock.writes[0].rpc==='create_player_with_team'&&$('playerMsg').textContent.includes('עדכון מאושר')),true);
+});
+
+test('a refresh retry captured before logout cannot read or display private data',async t=>{
+  const page=await app(t);
+  await page.evaluate(async()=>{
+    $('teamYear').value='2012';$('teamName').value='קבוצה';$('coachName').value='מאמן';mock.readError={message:'offline'};
+    await $('addTeam').onclick();window.retry=document.querySelector('#teamMsg button');await $('logout').onclick();mock.readError=null;
+    const count=mock.reads.length;await window.retry.onclick();window.extraReads=mock.reads.length-count;
+  });
+  assert.equal(await page.evaluate(()=>extraReads===0&&teams.length===0&&$('teamMsg').textContent===''),true);
+});
+
+test('changed content permits a new save but returning to confirmed content does not duplicate it',async t=>{
+  const page=await app(t);
+  await page.evaluate(async()=>{
+    $('teamYear').value='2012';$('teamName').value='קבוצה א';$('coachName').value='מאמן';await $('addTeam').onclick();
+    $('teamName').value='קבוצה ב';await $('addTeam').onclick();
+    $('teamName').value='קבוצה א';await $('addTeam').onclick();
+  });
+  assert.equal(await page.evaluate(()=>mock.writes.length),2);
+});
+
+test('attendance can be updated and then reverted without the duplicate guard blocking the change',async t=>{
+  const page=await app(t);
+  await page.evaluate(async()=>{
+    document.querySelector('.att-rpe').value='5';await $('saveAttendance').onclick();
+    document.querySelector('.att-rpe').value='7';await $('saveAttendance').onclick();
+    document.querySelector('.att-rpe').value='5';await $('saveAttendance').onclick();
+  });
+  const values=await page.evaluate(()=>mock.writes.map(w=>w.data[0].player_rpe));
+  assert.deepEqual(values,[5,7,5]);
 });

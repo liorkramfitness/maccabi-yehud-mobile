@@ -18,6 +18,7 @@ let db=null,user=null,teams=[],players=[],members=[],sessions=[],attendance=[],r
 let authSubscription=null,authVersion=0,loadVersion=0,loggingOut=false;
 const pendingActions=new Set();
 const pendingPromises=new Map();
+const confirmedSaves=new Map(),playerRequests=new Map();
 const msg=(id,value,error=false)=>{$(id).textContent=value;$(id).className=error?'error':'ok'};
 const readConfig=()=>{try{return JSON.parse(localStorage.getItem(configKey)||'{}')}catch{return {}}};
 
@@ -56,6 +57,7 @@ function showAuth(){
 }
 function clearUserData(){
   authVersion++;loadVersion++;
+  confirmedSaves.clear();playerRequests.clear();
   user=null;recovery=false;teams=[];players=[];members=[];sessions=[];attendance=[];
   document.querySelectorAll('main input,main textarea').forEach(input=>{if(!['sbUrl','sbKey'].includes(input.id))input.value=''});
   ['sessionField','sessionStatus'].forEach(id=>$(id).selectedIndex=0);
@@ -134,11 +136,39 @@ function renderLoads(){
   }).join('')||'<p class="muted">אין שחקנים בקבוצה.</p>';
 }
 
-async function insertOne(table,data,ctx){
+// A committed write and the following read are separate outcomes.
+async function refreshSaved(ctx,messageId,success){
+  if(!isCurrent(ctx))return;
+  msg(messageId,success);
+  try{await loadAll();if(isCurrent(ctx))msg(messageId,success);}
+  catch(error){
+    if(!isCurrent(ctx))return;
+    msg(messageId,success+' רענון הנתונים נכשל. אפשר לרענן שוב ללא שמירה נוספת.');
+    const button=document.createElement('button');
+    button.type='button';button.className='btn alt';button.textContent='רענן נתונים';
+    button.onclick=async()=>{
+      if(button.disabled||!isCurrent(ctx))return;
+      button.disabled=true;
+      try{await refreshSaved(ctx,messageId,success)}finally{button.disabled=false;}
+    };
+    $(messageId).appendChild(button);
+  }
+}
+async function saveAndRefresh(actionId,messageId,data,ctx,write,success){
+  const fingerprint=JSON.stringify(data);
   assertCurrent(ctx);
-  const {error}=await ctx.client.from(table).insert({...data,owner_id:ctx.ownerId});
-  assertCurrent(ctx);if(error)throw error;
-  await loadAll();assertCurrent(ctx);
+  // A repeated click after a successful write retries only the read.
+  const saved=confirmedSaves.get(actionId);
+  if(!saved?.has(fingerprint)){
+    const {error}=await write();
+    assertCurrent(ctx);if(error)throw error;
+    // Attendance is editable: allow a later change back to a previous value.
+    confirmedSaves.set(actionId,new Set(actionId==='saveAttendance'?[fingerprint]:[...(saved||[]),fingerprint]));
+  }
+  await refreshSaved(ctx,messageId,success);
+}
+async function insertOne(table,data,ctx,actionId,messageId,success){
+  await saveAndRefresh(actionId,messageId,data,ctx,()=>ctx.client.from(table).insert({...data,owner_id:ctx.ownerId}),success);
 }
 bindAction('saveConfig','configMsg',async()=>{
   const url=$('sbUrl').value.trim().replace(/\/$/,''),key=$('sbKey').value.trim();
@@ -192,25 +222,29 @@ bindAction('addTeam','teamMsg',async()=>{
   const ctx=context();
   if(!$('teamName').value.trim()||!$('coachName').value.trim())throw Error('יש למלא שם קבוצה ומאמן.');
   const birth_year=numberValue($('teamYear'),'שנתון',2000,2100,1,true);
-  await insertOne('my_teams',{birth_year,team_name:$('teamName').value.trim(),coach_name:$('coachName').value.trim(),status:'active'},ctx);
-  msg('teamMsg','הקבוצה נשמרה.');
+  await insertOne('my_teams',{birth_year,team_name:$('teamName').value.trim(),coach_name:$('coachName').value.trim(),status:'active'},ctx,'addTeam','teamMsg','הקבוצה נשמרה.');
 });
 bindAction('addPlayer','playerMsg',async()=>{
   const ctx=context(),team_id=$('playerTeam').value;
-  if(!team_id||!$('playerName').value.trim())throw Error('בחר קבוצה והזן שם שחקן.');
-  const {data,error}=await ctx.client.from('my_players').insert({owner_id:ctx.ownerId,full_name:$('playerName').value.trim(),age_note:$('ageNote').value.trim()||null}).select('id').single();
-  assertCurrent(ctx);if(error)throw error;
-  const {error:linkError}=await ctx.client.from('my_team_players').insert({owner_id:ctx.ownerId,team_id,player_id:data.id});
-  assertCurrent(ctx);if(linkError)throw Error('השחקן נוצר, אך השיוך לקבוצה נכשל. אין ליצור אותו שוב: '+linkError.message);
-  $('playerName').value='';await loadAll();assertCurrent(ctx);msg('playerMsg','השחקן נשמר.');
+  const full_name=$('playerName').value.trim(),age_note=$('ageNote').value.trim()||null;
+  if(!team_id||!full_name)throw Error('בחר קבוצה והזן שם שחקן.');
+  const data={team_id,full_name,age_note},fingerprint=JSON.stringify(data);
+  // Retain the same request ID on error, including an ambiguous network failure.
+  if(!playerRequests.has(fingerprint))playerRequests.set(fingerprint,crypto.randomUUID());
+  await saveAndRefresh('addPlayer','playerMsg',data,ctx,async()=>{
+    const result=await ctx.client.rpc('create_player_with_team',{
+      p_player_id:playerRequests.get(fingerprint),p_team_id:team_id,p_full_name:full_name,p_age_note:age_note
+    });
+    if(result.error?.code==='PGRST202')throw Error('שמירת שחקנים דורשת עדכון מאושר במסד הנתונים. לא נוצר שחקן.');
+    return result;
+  },'השחקן והשיוך לקבוצה נשמרו.');
 });
 bindAction('saveSession','sessionMsg',async()=>{
   const ctx=context();
   if(!$('sessionTeam').value||!$('sessionDate').value)throw Error('בחר קבוצה ותאריך.');
   const active_minutes=numberValue($('sessionMinutes'),'דקות אימון',0,300);
   const coach_intensity=numberValue($('sessionRPE'),'RPE מאמן',0,10,0.5);
-  await insertOne('my_sessions',{team_id:$('sessionTeam').value,scheduled_date:$('sessionDate').value,start_time:$('sessionTime').value||null,field_name:$('sessionField').value,session_status:$('sessionStatus').value,active_minutes,coach_intensity,planned_content:$('plannedContent').value||null,actual_content:$('actualContent').value||null,notes:$('sessionNotes').value||null},ctx);
-  msg('sessionMsg','האימון נשמר בענן.');
+  await insertOne('my_sessions',{team_id:$('sessionTeam').value,scheduled_date:$('sessionDate').value,start_time:$('sessionTime').value||null,field_name:$('sessionField').value,session_status:$('sessionStatus').value,active_minutes,coach_intensity,planned_content:$('plannedContent').value||null,actual_content:$('actualContent').value||null,notes:$('sessionNotes').value||null},ctx,'saveSession','sessionMsg','האימון נשמר בענן.');
 });
 bindAction('saveAttendance','attendanceMsg',async()=>{
   const ctx=context(),session_id=$('attendanceSession').value;
@@ -221,9 +255,8 @@ bindAction('saveAttendance','attendanceMsg',async()=>{
     player_rpe:numberValue(x.querySelector('.att-rpe'),'RPE אישי',0,10,0.5)
   }));
   if(!rows.length)throw Error('אין שחקנים באימון.');
-  const {error}=await ctx.client.from('my_attendance').upsert(rows,{onConflict:'session_id,player_id'});
-  assertCurrent(ctx);if(error)throw error;
-  await loadAll();assertCurrent(ctx);msg('attendanceMsg','הנוכחות נשמרה בענן.');
+  await saveAndRefresh('saveAttendance','attendanceMsg',rows,ctx,
+    ()=>ctx.client.from('my_attendance').upsert(rows,{onConflict:'session_id,player_id'}),'הנוכחות נשמרה בענן.');
 });
 ['rosterTeam','attendanceSession','loadTeam'].forEach(id=>$(id).addEventListener('change',()=>{renderRoster();renderAttendance();renderLoads()}));
 document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.page').forEach(x=>x.classList.toggle('active',x.id===b.dataset.tab))});

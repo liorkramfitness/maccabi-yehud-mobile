@@ -73,7 +73,8 @@ function bindAction(id,messageId,action){
     if(pendingActions.has(id)||loggingOut)return;
     pendingActions.add(id);$(id).disabled=true;
     const version=authVersion;
-    const task=Promise.resolve().then(action);pendingPromises.set(id,task);
+    const task=Promise.resolve().then(()=>{if(!loggingOut&&version===authVersion)return action()});
+    pendingPromises.set(id,task);
     try{await task}catch(error){if(version===authVersion)msg(messageId,error.message,true)}
     finally{pendingActions.delete(id);pendingPromises.delete(id);$(id).disabled=false;}
   };
@@ -178,7 +179,9 @@ $('logout').onclick=async()=>{
   clearUserData();
   // Remove this device's session only. No application records are deleted.
   try{
-    await Promise.allSettled([...pendingPromises.values()]);
+    // An in-flight login must finish before its session is removed.
+    // Data writes must not delay removal of the local auth session.
+    await Promise.allSettled([...pendingPromises.entries()].filter(([id])=>['login','savepass','saveConfig'].includes(id)).map(([,task])=>task));
     if(client){const {error}=await client.auth.signOut({scope:'local'});if(error)throw error;}
     clearUserData();
     msg('authMsg','התנתקת.');

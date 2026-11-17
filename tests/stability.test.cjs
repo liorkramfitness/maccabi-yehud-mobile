@@ -194,3 +194,18 @@ test('a delayed getSession response cannot restore a logged-out user',async t=>{
   await page.evaluate(async()=>{mock.releaseSession();await window.connectTask});
   assert.equal(await page.evaluate(()=>user===null&&teams.length===0&&$('identity').textContent===''),true);
 });
+
+test('logout removes the local session without waiting for a hung data write',async t=>{
+  const page=await app(t);
+  await page.evaluate(()=>{mock.delays.write=true;$('teamYear').value='2012';$('teamName').value='קבוצה';$('coachName').value='מאמן';window.saveTask=$('addTeam').onclick()});
+  await page.waitForFunction(()=>!!mock.releases.write);
+  await page.evaluate(()=>$('logout').onclick());
+  assert.equal(await page.evaluate(()=>mock.signOuts.length===1&&user===null&&teams.length===0),true);
+  await page.evaluate(async()=>{mock.releases.write();await window.saveTask});
+});
+
+test('logout cancels a save queued in the same event turn',async t=>{
+  const page=await app(t);
+  await page.evaluate(async()=>{const saving=$('saveConfig').onclick();const leaving=$('logout').onclick();await Promise.all([saving,leaving])});
+  assert.equal(await page.evaluate(()=>user===null&&mock.signOuts.length===1),true);
+});
